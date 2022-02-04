@@ -3,7 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 class Spectral_img:
-    def __init__(self, paths, bands = ["G", "R", "IR", "NIR"]):
+
+    def __init__(self, paths, bands = ["G", "R", "IR", "NIR"], crop = True):
 
         self.min_threshold = 20
         self.offsets = [10,-10]
@@ -20,12 +21,13 @@ class Spectral_img:
         self.draw_matches = []
 
         self.read_imgs()
-        
-        offset = self.imgs[self.bands[0]].shape[0]//3
-        self.imgs[self.bands[0]] = self.imgs[self.bands[0]][offset:, ]
-        self.imgs[self.bands[1]] = self.imgs[self.bands[1]][offset:,]
-        self.imgs[self.bands[2]] = self.imgs[self.bands[2]][:-offset,]
-        self.imgs[self.bands[3]] = self.imgs[self.bands[3]][:-offset]
+
+        if crop:
+            offset = self.imgs[self.bands[0]].shape[0]//4
+            self.imgs[self.bands[0]] = self.imgs[self.bands[0]][offset:, ]
+            self.imgs[self.bands[1]] = self.imgs[self.bands[1]][offset:,]
+            self.imgs[self.bands[2]] = self.imgs[self.bands[2]][:-offset,]
+            self.imgs[self.bands[3]] = self.imgs[self.bands[3]][:-offset]
 
         self.align()
         
@@ -46,8 +48,58 @@ class Spectral_img:
         img_norm = cv2.equalizeHist(img_blur)
         ret, img_norm = cv2.threshold(img_norm, self.min_threshold, 255, cv2.THRESH_TOZERO)
         return img
+    
+    def get_gradient(self, im):
+        # Calculate the x and y gradients using Sobel operator
+        grad_x = cv2.Sobel(im,cv2.CV_32F,1,0,ksize=3)
+        grad_y = cv2.Sobel(im,cv2.CV_32F,0,1,ksize=3)
 
-    def warp_img(self, img_original, base, draw_matches = False):
+        # Combine the two gradients
+        grad = cv2.addWeighted(np.absolute(grad_x), 0.5, np.absolute(grad_y), 0.5, 0)
+        #plt.imshow(grad)
+        #plt.show()
+        return grad
+
+
+    def warp_ECC(self, im2, im1, draw_matches = False, mode = cv2.MOTION_TRANSLATION):
+        """ Align images using ECC. Modes: cv2.MOTION_TRANSLATION || cv2.MOTION_HOMOGRAPHY """
+        im1_gray = self.equalize_smooth(im1)
+        im2_gray = self.equalize_smooth(im2)   
+
+        # Find size of image1
+        sz = im1.shape
+
+        # Define the motion model
+        warp_mode =  mode #cv2.MOTION_TRANSLATION || cv2.MOTION_HOMOGRAPHY
+
+        # Define 2x3 or 3x3 matrices and initialize the matrix to identity
+        if warp_mode == cv2.MOTION_HOMOGRAPHY :
+            warp_matrix = np.eye(3, 3, dtype=np.float32)
+        else :
+            warp_matrix = np.eye(2, 3, dtype=np.float32)
+
+        # Specify the number of iterations.
+        number_of_iterations = 5000;
+
+        # Specify the threshold of the increment
+        # in the correlation coefficient between two iterations
+        termination_eps = 1e-10;
+
+        # Define termination criteria
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
+
+        # Run the ECC algorithm. The results are stored in warp_matrix.
+        (cc, warp_matrix) = cv2.findTransformECC(self.get_gradient(im1_gray), self.get_gradient(im2_gray), warp_matrix, warp_mode, criteria, inputMask=None, gaussFiltSize=1)
+
+        if warp_mode == cv2.MOTION_HOMOGRAPHY :
+            # Use warpPerspective for Homography
+            im2_aligned = cv2.warpPerspective (im2, warp_matrix, (sz[1],sz[0]), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+        else :
+            # Use warpAffine for Translation, Euclidean and Affine
+            im2_aligned = cv2.warpAffine(im2, warp_matrix, (sz[1],sz[0]), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP);
+        return im2_aligned
+
+    def warp_SIFT(self, img_original, base, draw_matches = False):
         #if (img_original.all() == base.all()): return img_original
 
         if (len(base.shape) > 2):
@@ -60,7 +112,8 @@ class Spectral_img:
 
         # Seleção dos descriptors:
         # descriptor = cv2.SIFT.create()
-        descriptor = cv2.xfeatures2d.SURF_create() #O SURF não é um algoritmo open source e só é incluido no opencv-contrib-python use com cautela.
+        descriptor = cv2.xfeatures2d.SURF_create(1000)
+        descriptor.setUpright(True)
         matcher = cv2.FlannBasedMatcher()
 
         # get features from images
@@ -73,13 +126,11 @@ class Spectral_img:
 
         matches = []
         # ensure the distance is within a certain ratio of each other (i.e. Lowe's ratio test)
-        ratio = 0.75
+        ratio = .75
         for m in rawMatch:
             if len(m) == 2 and m[0].distance < m[1].distance * ratio:
                 matches.append((m[0].trainIdx, m[0].queryIdx))
-                # print("Train index: ", m[0].trainIdx, "\n Query index", m[0].queryIdx)
-                # print()
-                
+
         if draw_matches:
             # Apply ratio test
             good = []
@@ -108,16 +159,19 @@ class Spectral_img:
     #     warped = cv2.warpPerspective(img_original, H, (base.shape[1], base.shape[0]))
         return warped
 
-    def align(self, base = None):
+    def align(self, base = None, mode = "SIFT"):
         if (base == None): base =  self.bands[3]
         self.draw_matches = [] #Reset the matches drawings
 
         for band in self.bands:
-                self.warped_imgs[band] = self.warp_img(self.imgs[band], self.imgs[base], True)
-                if (band == self.bands[0]):
-                     x, y, w, h  = cv2.boundingRect(cv2.findNonZero(self.warped_imgs[self.bands[0]]))
-                     x, y, w, h = x+self.offsets[0], y+self.offsets[0], w+self.offsets[1], h+self.offsets[1]
-                self.croped_imgs[band] = self.warped_imgs[band][y:y+h, x:x+w]
+            if mode == "SIFT":
+                self.warped_imgs[band] = self.warp_SIFT(self.imgs[band], self.imgs[base], True)
+            else:
+                self.warped_imgs[band] = self.warp_ECC(self.imgs[band], self.imgs[base], True)
+            if (band == self.bands[0]):
+                    x, y, w, h  = cv2.boundingRect(cv2.findNonZero(self.warped_imgs[self.bands[0]]))
+                    x, y, w, h = x+self.offsets[0], y+self.offsets[0], w+self.offsets[1], h+self.offsets[1]
+            self.croped_imgs[band] = self.warped_imgs[band][y:y+h, x:x+w]
 
         return
 
@@ -126,7 +180,7 @@ class Spectral_img:
         if len(self.draw_matches) == 4: rows = 4 
         else: rows = 3
 
-        fig, axs = plt.subplots(4,rows, constrained_layout = True, figsize = (4*5, 4*5)) 
+        fig, axs = plt.subplots(rows, 4, constrained_layout = True, figsize = (4*5, rows*2)) 
         for i in range(4):
             axs[0][i].imshow(s.imgs[self.bands[i]])
             axs[1][i].imshow(s.warped_imgs[self.bands[i]])
@@ -141,3 +195,8 @@ class Spectral_img:
         plt.imshow(merged)
         plt.show()
         return 
+n = "20"
+paths = ["imgs/Soja_v1_2_PlantasDiversas/Soja_v1_2_PlantasDiversasG"+n+".png", "imgs/Soja_v1_2_PlantasDiversas/Soja_v1_2_PlantasDiversasR"+n+".png", "imgs/Soja_v1_2_PlantasDiversas/Soja_v1_2_PlantasDiversasNIR"+n+".png", "imgs/Soja_v1_2_PlantasDiversas/Soja_v1_2_PlantasDiversasIR"+n+".png"]
+bands = ["G", "R", "IR", "NIR"]
+#paths = ["imgs/Soja_v3G-01-03.png","imgs/Soja_v3R-01-03.png","imgs/Soja_v3NIR-01-03.png","imgs/Soja_v3IR-01-03.png"]
+s = Spectral_img(paths, bands[::], False)
